@@ -1,0 +1,1 @@
+export { EstadoCaptacion, Tienda } from './tienda.entity';

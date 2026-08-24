@@ -1,0 +1,1 @@
+export { TiendaController } from './tienda.controller';

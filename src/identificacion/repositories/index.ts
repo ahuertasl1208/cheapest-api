@@ -1,0 +1,1 @@
+export { TiendaRepository } from './tienda.repository';

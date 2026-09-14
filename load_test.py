@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
 """
-Pruebas de carga contra el backend monolitico de Cheapest (NestJS).
+Pruebas de carga contra el monolito de Cheapest desplegado en AWS.
 
-Escenarios > 450 threads, donde JMeter deja de ser confiable.
+Se usa para los escenarios de mas de 450 threads, donde JMeter deja de ser
+un generador de carga confiable y se vuelve el cuello de botella del cliente.
+
+A diferencia del Lab 2, el destino ya no es localhost sino el DNS del
+Application Load Balancer. Toda medicion incluye el RTT de red hasta
+us-east-1, por lo que conviene registrar la latencia base con --baseline
+antes de la matriz.
 
 Instalacion:
-    pip3 install aiohttp matplotlib
+    pip3 install aiohttp
 
 Uso:
-    python3 load_test.py --endpoint GET  --users 1500 --ramp-up 75  --duration 60 --out-prefix alta_c1
-    python3 load_test.py --endpoint POST --users 3000 --ramp-up 100 --duration 60 --out-prefix muyalta_c1
+    python3 load_test.py --baseline
+    python3 load_test.py --endpoint GET  --users 1500  --ramp-up 75  --duration 60 --out-prefix get_alta_c1
+    python3 load_test.py --endpoint POST --users 18000 --ramp-up 200 --duration 60 --out-prefix post_fuerte_c1
 
 Modelo temporal:
-    Los primeros --ramp-up segundos la concurrencia sube linealmente de 0 a --users.
-    Despues se SOSTIENE en --users durante --duration segundos.
-    Duracion total del proceso = ramp-up + duration.
+    Durante los primeros --ramp-up segundos la concurrencia sube linealmente
+    de 0 a --users. Despues se SOSTIENE en --users durante --duration segundos.
+    Duracion total = ramp-up + duration.
+
     Las metricas se reportan dos veces: sobre toda la corrida y solo sobre la
-    ventana sostenida (steady state), que es la comparable con los ASRs.
+    ventana sostenida (steady state). La ventana sostenida es la comparable
+    con los ASRs, porque durante el ramp-up la concurrencia todavia no es la
+    nominal y los percentiles salen optimistas.
 """
 
 import argparse
@@ -31,295 +41,372 @@ import sys
 import time
 import uuid
 from datetime import datetime, timezone
-from urllib.parse import urlencode
 
 try:
     import aiohttp
 except ImportError:
-    sys.exit("Falta aiohttp. Instale con: pip3 install aiohttp")
+    sys.exit("Falta aiohttp. Instale con:  pip3 install aiohttp")
 
-# --------------------------------------------------------------------------
-# Configuracion fija del laboratorio (IDs sembrados por seed.sql)
-# --------------------------------------------------------------------------
-BASE_URL = "http://localhost:3000"
+# ----------------------------------------------------------------------------
+# Configuracion del sistema bajo prueba
+# ----------------------------------------------------------------------------
+
+ALB_DNS = "Cheapest-alb-119288833.us-east-1.elb.amazonaws.com"
+
+RUTA_GET = "/logistics/tenderos/productos-disponibles"
+RUTA_POST = "/logistics/pedidos"
+RUTA_HEALTH = "/health"
+
+# Parametros fijos del GET. La zona se pasa por params para que aiohttp la
+# codifique: un espacio sin codificar devuelve 400 en todas las peticiones.
 TIENDA_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
-MONEDA_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
-PRODUCTO_FALLBACK = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 ZONA = "Zona Norte"
 
-GET_PATH = "/logistics/tenderos/productos-disponibles"
-POST_PATH = "/logistics/pedidos"
+MONEDA_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+PRODUCTO_FALLBACK = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
-REQUEST_TIMEOUT = 30      # segundos
-ITEMS_POR_PEDIDO = 25     # > 20 segun el enunciado
-
-
-# --------------------------------------------------------------------------
-# Construccion de requests
-# --------------------------------------------------------------------------
-def build_get_url():
-    # urlencode codifica el espacio de "Zona Norte"; sin esto el backend
-    # responde 400 y se mediria un error de cliente, no de saturacion.
-    return f"{BASE_URL}{GET_PATH}?" + urlencode({"tiendaId": TIENDA_ID, "zona": ZONA})
+ITEMS_POR_PEDIDO = 25   # el laboratorio exige un pedido grande (> 20 items)
+TIMEOUT_S = 30
 
 
-def load_productos(path="productos.txt"):
-    if os.path.exists(path):
-        with open(path) as fh:
-            ids = [line.strip() for line in fh if line.strip()]
+# ----------------------------------------------------------------------------
+# Construccion del body del POST
+# ----------------------------------------------------------------------------
+
+def cargar_productos(ruta):
+    """Lee UUIDs reales de productos, uno por linea.
+
+    Sin UUIDs que existan en la base, cada insert falla por llave foranea y
+    el Error % mediria datos invalidos en vez de saturacion del sistema.
+    """
+    if ruta and os.path.exists(ruta):
+        with open(ruta) as f:
+            ids = [l.strip() for l in f if l.strip()]
         if ids:
-            print(f"[info] {len(ids)} productoId cargados desde {path}")
             return ids
-    print(f"[warn] {path} no encontrado o vacio. Usando UUID de fallback.")
-    print("[warn] Si el POST devuelve 400/500, extraiga UUIDs reales con:")
-    print('[warn]   docker exec -it cheapest-postgres psql -U postgres -d cheapest '
-          '-t -A -c "select id from productos limit 30;" > productos.txt')
+        print(f"AVISO: {ruta} esta vacio, se usa el UUID de respaldo.")
+    else:
+        print(f"AVISO: no se encontro {ruta}, se usa el UUID de respaldo.")
+        print("       Genere el archivo con:")
+        print("       sudo docker exec cheapest-db psql -U postgres -d cheapest "
+              "-t -A -c \"select id from productos limit 50;\" > productos.txt")
     return [PRODUCTO_FALLBACK]
 
 
-def build_post_body(productos):
-    """Cada llamada genera un identificador unico: si se repitiera, la BD
-    devolveria error de clave duplicada y el Error % mediria colisiones de
-    datos en lugar de saturacion del sistema."""
+def construir_body(productos):
+    """Genera un pedido que cumple el contrato del DTO.
+
+    'identificador' es unico por peticion. Si se repitiera, la base lo
+    rechazaria por clave duplicada y el Error % reflejaria colisiones de
+    datos en lugar de la capacidad real del sistema.
+    """
     items = []
-    total = 0.0
     for _ in range(ITEMS_POR_PEDIDO):
-        precio = round(random.uniform(1000, 20000), 2)
-        cantidad = random.randint(1, 10)
-        descuento = round(random.uniform(0, 500), 2)
-        total += precio * cantidad - descuento
         items.append({
             "productoId": random.choice(productos),
-            "cantidad": cantidad,
-            "precioUnitario": precio,
-            "descuento": descuento,
+            "cantidad": random.randint(1, 10),
+            "precioUnitario": round(random.uniform(1000, 50000), 2),
+            "descuento": 0,
             "monedaId": MONEDA_ID,
         })
+    monto = round(sum(i["precioUnitario"] * i["cantidad"] for i in items), 2)
     return {
-        "identificador": f"PED-{uuid.uuid4()}"[:100],
+        "identificador": f"PED-{uuid.uuid4()}",
         "tiendaId": TIENDA_ID,
         "fechaHoraCreacion": datetime.now(timezone.utc).isoformat(),
-        "montoTotal": round(total, 2),
+        "montoTotal": monto,
         "monedaId": MONEDA_ID,
         "estado": "creado",
         "items": items,
     }
 
 
-# --------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # Motor de carga
-# --------------------------------------------------------------------------
-async def send_one(session, method, url, body, results, steady_at):
-    started = time.perf_counter()
-    ts = datetime.now(timezone.utc).isoformat()
+# ----------------------------------------------------------------------------
+
+class Registro:
+    __slots__ = ("t_inicio", "status", "latencia_ms", "error")
+
+    def __init__(self, t_inicio, status, latencia_ms, error):
+        self.t_inicio = t_inicio
+        self.status = status
+        self.latencia_ms = latencia_ms
+        self.error = error
+
+
+async def una_peticion(sesion, base, endpoint, productos, registros, t0):
+    inicio = time.perf_counter()
+    marca = time.time()
     status, error = 0, ""
     try:
-        if method == "GET":
-            async with session.get(url) as resp:
-                await resp.read()
-                status = resp.status
+        if endpoint == "GET":
+            url = base + RUTA_GET
+            params = {"tiendaId": TIENDA_ID, "zona": ZONA}
+            async with sesion.get(url, params=params) as r:
+                await r.read()
+                status = r.status
         else:
-            async with session.post(url, json=body) as resp:
-                await resp.read()
-                status = resp.status
+            url = base + RUTA_POST
+            cuerpo = construir_body(productos)
+            cabeceras = {"Content-Type": "application/json",
+                         "Accept": "application/json"}
+            async with sesion.post(url, json=cuerpo, headers=cabeceras) as r:
+                await r.read()
+                status = r.status
         if status >= 400:
             error = f"http_{status}"
     except asyncio.TimeoutError:
         error = "timeout"
     except aiohttp.ClientConnectorError:
         error = "connection_error"
-    except aiohttp.ClientError as exc:
-        error = f"client_error:{type(exc).__name__}"
-    except Exception as exc:  # noqa: BLE001
-        error = f"other:{type(exc).__name__}"
+    except aiohttp.ClientError as e:
+        error = f"client_error:{type(e).__name__}"
+    except Exception as e:
+        error = f"otro:{type(e).__name__}"
 
-    latency_ms = (time.perf_counter() - started) * 1000
-    results.append({
-        "timestamp_iso": ts,
-        "status_code": status,
-        "latency_ms": round(latency_ms, 2),
-        "error": error,
-        "steady": time.perf_counter() >= steady_at,
-    })
+    latencia = (time.perf_counter() - inicio) * 1000
+    registros.append(Registro(marca, status, latencia, error))
 
 
-async def worker(idx, session, args, productos, results, t0, steady_at, deadline):
-    # Arranque escalonado: reparte los --users a lo largo del ramp-up.
-    delay = (args.ramp_up * idx / args.users) if args.users else 0
-    await asyncio.sleep(max(0.0, (t0 + delay) - time.perf_counter()))
-
-    url = build_get_url() if args.endpoint == "GET" else f"{BASE_URL}{POST_PATH}"
-    while time.perf_counter() < deadline:
-        body = build_post_body(productos) if args.endpoint == "POST" else None
-        await send_one(session, args.endpoint, url, body, results, steady_at)
+async def trabajador(idx, sesion, base, endpoint, productos, registros,
+                     t0, retraso, fin):
+    """Un usuario simulado: espera su turno del ramp-up y luego envia
+    peticiones en serie hasta que termina la corrida."""
+    await asyncio.sleep(retraso)
+    while time.perf_counter() < fin:
+        await una_peticion(sesion, base, endpoint, productos, registros, t0)
 
 
-async def run(args, productos):
-    results = []
-    timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-    connector = aiohttp.TCPConnector(limit=args.conn_limit, limit_per_host=args.conn_limit)
+async def ejecutar(args, productos):
+    base = args.base_url.rstrip("/")
+    registros = []
 
-    t0 = time.perf_counter()
-    steady_at = t0 + args.ramp_up
-    deadline = steady_at + args.duration
+    conector = aiohttp.TCPConnector(
+        limit=args.conn_limit,
+        limit_per_host=args.conn_limit,
+        ttl_dns_cache=300,
+    )
+    timeout = aiohttp.ClientTimeout(total=TIMEOUT_S)
 
-    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        tasks = [
+    async with aiohttp.ClientSession(connector=conector, timeout=timeout) as sesion:
+        t0 = time.perf_counter()
+        fin = t0 + args.ramp_up + args.duration
+        paso = args.ramp_up / args.users if args.users else 0
+
+        tareas = [
             asyncio.create_task(
-                worker(i, session, args, productos, results, t0, steady_at, deadline)
+                trabajador(i, sesion, base, args.endpoint, productos,
+                           registros, t0, i * paso, fin)
             )
             for i in range(args.users)
         ]
-        # Progreso simple para no quedarse mirando una terminal muda.
-        async def ticker():
-            while time.perf_counter() < deadline:
-                await asyncio.sleep(10)
-                elapsed = time.perf_counter() - t0
-                fase = "ramp-up" if elapsed < args.ramp_up else "sostenido"
-                print(f"  [{elapsed:6.1f}s] {fase:9s} requests={len(results)}")
-        tick = asyncio.create_task(ticker())
-        await asyncio.gather(*tasks, return_exceptions=True)
-        tick.cancel()
 
-    return results, (time.perf_counter() - t0)
+        inicio_sostenido = t0 + args.ramp_up
+        await asyncio.gather(*tareas, return_exceptions=True)
+
+    return registros, t0, inicio_sostenido
 
 
-# --------------------------------------------------------------------------
-# Metricas y salida
-# --------------------------------------------------------------------------
-def percentile(values, pct):
-    if not values:
+# ----------------------------------------------------------------------------
+# Metricas
+# ----------------------------------------------------------------------------
+
+def percentil(valores, p):
+    if not valores:
         return 0.0
-    ordered = sorted(values)
-    k = max(0, min(len(ordered) - 1, int(round(pct / 100 * len(ordered) + 0.5)) - 1))
-    return ordered[k]
+    orden = sorted(valores)
+    k = (len(orden) - 1) * (p / 100)
+    bajo, alto = int(k), min(int(k) + 1, len(orden) - 1)
+    return orden[bajo] + (orden[alto] - orden[bajo]) * (k - int(k))
 
 
-def summarize(rows, window_seconds, label):
-    if not rows:
-        print(f"\n--- {label}: sin datos ---")
+def resumir(registros, segundos, etiqueta):
+    if not registros:
+        print(f"\n[{etiqueta}] sin peticiones registradas.")
         return None
-    lat = [r["latency_ms"] for r in rows]
-    errores = [r for r in rows if r["error"]]
-    total = len(rows)
 
-    tipos = {}
-    for r in errores:
-        clave = r["error"].split(":")[0]
-        tipos[clave] = tipos.get(clave, 0) + 1
+    latencias = [r.latencia_ms for r in registros]
+    fallidos = [r for r in registros if r.error]
+    total = len(registros)
 
-    stats = {
-        "total": total,
-        "throughput": total / window_seconds if window_seconds else 0,
-        "avg": statistics.mean(lat),
-        "p95": percentile(lat, 95),
-        "p99": percentile(lat, 99),
-        "error_pct": len(errores) / total * 100,
-        "tipos": tipos,
+    m = {
+        "etiqueta": etiqueta,
+        "samples": total,
+        "throughput": total / segundos if segundos > 0 else 0,
+        "promedio": statistics.mean(latencias),
+        "min": min(latencias),
+        "max": max(latencias),
+        "desv": statistics.pstdev(latencias) if total > 1 else 0.0,
+        "p95": percentil(latencias, 95),
+        "p99": percentil(latencias, 99),
+        "error_pct": len(fallidos) / total * 100,
     }
 
-    print(f"\n--- {label} ---")
-    print(f"  Requests totales : {stats['total']}")
-    print(f"  Throughput       : {stats['throughput']:.2f} req/s")
-    print(f"  Latencia promedio: {stats['avg']:.2f} ms")
-    print(f"  Latencia p95     : {stats['p95']:.2f} ms")
-    print(f"  Latencia p99     : {stats['p99']:.2f} ms")
-    print(f"  Error %          : {stats['error_pct']:.2f} %")
-    if tipos:
+    print(f"\n--- {etiqueta} ---")
+    print(f"  # Samples        : {m['samples']}")
+    print(f"  Throughput       : {m['throughput']:.2f} req/s")
+    print(f"  Latencia promedio: {m['promedio']:.1f} ms")
+    print(f"  Min / Max        : {m['min']:.1f} / {m['max']:.1f} ms")
+    print(f"  Desv. estandar   : {m['desv']:.1f} ms")
+    print(f"  p95              : {m['p95']:.1f} ms")
+    print(f"  p99              : {m['p99']:.1f} ms")
+    print(f"  Error %          : {m['error_pct']:.2f} %")
+
+    if fallidos:
+        tipos = {}
+        for r in fallidos:
+            tipos[r.error] = tipos.get(r.error, 0) + 1
         print("  Desglose de errores:")
         for k, v in sorted(tipos.items(), key=lambda x: -x[1]):
-            print(f"    - {k:20s} {v}")
-    return stats
+            print(f"    {k}: {v} ({v / total * 100:.2f} %)")
+
+    return m
 
 
-def write_csv(rows, path):
-    with open(path, "w", newline="") as fh:
-        writer = csv.writer(fh)
-        writer.writerow(["timestamp_iso", "status_code", "latency_ms", "error"])
-        for r in rows:
-            writer.writerow([r["timestamp_iso"], r["status_code"], r["latency_ms"], r["error"]])
-    print(f"[ok] CSV escrito: {path}")
-
-
-def make_plots(rows, prefix, endpoint):
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("[warn] matplotlib no instalado; se omiten graficos.")
+def veredicto(m):
+    """Compara contra las medidas de respuesta de los ASRs del laboratorio."""
+    if not m:
         return
-
-    base = datetime.fromisoformat(rows[0]["timestamp_iso"])
-    segundos = [(datetime.fromisoformat(r["timestamp_iso"]) - base).total_seconds() for r in rows]
-    lat = [r["latency_ms"] for r in rows]
-
-    fig, ax = plt.subplots(figsize=(11, 4))
-    ax.scatter(segundos, lat, s=3, alpha=0.3)
-    ax.set_xlabel("Segundos desde el inicio")
-    ax.set_ylabel("Latencia (ms)")
-    ax.set_title(f"Latencia por request — {endpoint} — {prefix}")
-    fig.tight_layout()
-    fig.savefig(f"{prefix}_{endpoint.lower()}_latencia.png", dpi=110)
-
-    buckets = {}
-    for s in segundos:
-        buckets[int(s)] = buckets.get(int(s), 0) + 1
-    xs = sorted(buckets)
-    fig2, ax2 = plt.subplots(figsize=(11, 4))
-    ax2.plot(xs, [buckets[x] for x in xs])
-    ax2.set_xlabel("Segundos desde el inicio")
-    ax2.set_ylabel("Requests por segundo")
-    ax2.set_title(f"Throughput — {endpoint} — {prefix}")
-    fig2.tight_layout()
-    fig2.savefig(f"{prefix}_{endpoint.lower()}_throughput.png", dpi=110)
-    print(f"[ok] Graficos: {prefix}_{endpoint.lower()}_latencia.png / _throughput.png")
+    asr1 = m["p99"] < 1000
+    asr2 = m["error_pct"] <= 2
+    print("\n--- Cumplimiento de ASRs (ventana sostenida) ---")
+    print(f"  ASR 1  p99 < 1000 ms : {'CUMPLE' if asr1 else 'NO CUMPLE'} "
+          f"({m['p99']:.1f} ms)")
+    print(f"  ASR 2  Error % <= 2  : {'CUMPLE' if asr2 else 'NO CUMPLE'} "
+          f"({m['error_pct']:.2f} %)")
+    if asr1 and asr2:
+        print("  -> Todavia dentro de los ASRs. Suba al siguiente escenario.")
+    else:
+        print("  -> Punto de inflexion alcanzado en este nivel de carga.")
 
 
-# --------------------------------------------------------------------------
-def check_ulimit(users):
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    necesario = users + 256
-    if soft < necesario:
-        print(f"[warn] ulimit -n actual = {soft}, se recomiendan >= {necesario}.")
+def fila_tabla(args, m):
+    """Imprime la fila lista para pegar en la tabla del informe."""
+    print("\n--- Fila para la tabla de resultados ---")
+    print("| # threads/users | Ramp-up (s) | p99 (ms) | p95 (ms) | "
+          "Throughput (req/s) | Error % |")
+    print(f"| {args.users} | {args.ramp_up} | {m['p99']:.0f} | {m['p95']:.0f} | "
+          f"{m['throughput']:.2f} | {m['error_pct']:.2f} |")
+
+
+# ----------------------------------------------------------------------------
+# Utilidades
+# ----------------------------------------------------------------------------
+
+def exportar(registros, prefijo, endpoint):
+    nombre = f"{prefijo}_{endpoint.lower()}.csv"
+    with open(nombre, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["timestamp_iso", "metodo", "endpoint",
+                    "status_code", "latency_ms", "error"])
+        ruta = RUTA_GET if endpoint == "GET" else RUTA_POST
+        for r in registros:
+            w.writerow([
+                datetime.fromtimestamp(r.t_inicio, timezone.utc).isoformat(),
+                endpoint, ruta, r.status, f"{r.latencia_ms:.2f}", r.error,
+            ])
+    print(f"\nCSV escrito: {nombre}")
+    return nombre
+
+
+def revisar_descriptores(usuarios):
+    blando, duro = resource.getrlimit(resource.RLIMIT_NOFILE)
+    necesarios = int(usuarios * 1.2) + 256
+    if blando < necesarios:
+        print(f"AVISO: limite de descriptores ({blando}) por debajo de los "
+              f"~{necesarios} que requieren {usuarios} usuarios.")
+        print(f"       Suba el limite antes de correr:  ulimit -n {necesarios}")
         try:
-            resource.setrlimit(resource.RLIMIT_NOFILE, (min(necesario, hard), hard))
-            print(f"[ok] Limite elevado a {min(necesario, hard)} para este proceso.")
+            resource.setrlimit(resource.RLIMIT_NOFILE, (min(necesarios, duro), duro))
+            print(f"       Ajustado en caliente a {min(necesarios, duro)}.")
         except (ValueError, OSError):
-            print("[warn] No se pudo elevar. Ejecute antes:  ulimit -n 25000")
-            print("[warn] Si el SO no lo permite, repórtelo como restriccion del entorno.")
+            print("       No se pudo ajustar automaticamente.")
 
+
+async def medir_baseline(base, n=10):
+    """Latencia base contra /health. Es el piso de red que va incluido en
+    todas las mediciones de la matriz y hay que reportarlo en el informe."""
+    url = base.rstrip("/") + RUTA_HEALTH
+    tiempos = []
+    timeout = aiohttp.ClientTimeout(total=TIMEOUT_S)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        for _ in range(n):
+            t = time.perf_counter()
+            try:
+                async with s.get(url) as r:
+                    await r.read()
+                    if r.status == 200:
+                        tiempos.append((time.perf_counter() - t) * 1000)
+            except Exception as e:
+                print(f"  fallo: {type(e).__name__}")
+            await asyncio.sleep(0.3)
+    if tiempos:
+        print(f"\nLatencia base a {url}")
+        print(f"  muestras : {len(tiempos)}")
+        print(f"  promedio : {statistics.mean(tiempos):.1f} ms")
+        print(f"  min / max: {min(tiempos):.1f} / {max(tiempos):.1f} ms")
+        print("\nEste valor es el piso de red de todas las mediciones.")
+    else:
+        print("No hubo respuestas exitosas. Revise el ALB y los targets.")
+
+
+# ----------------------------------------------------------------------------
 
 def main():
-    p = argparse.ArgumentParser(description="Pruebas de carga - Lab 2 Cheapest")
-    p.add_argument("--endpoint", choices=["GET", "POST"], required=True)
-    p.add_argument("--users", type=int, required=True, help="Concurrencia objetivo")
-    p.add_argument("--ramp-up", type=float, default=0, dest="ramp_up")
-    p.add_argument("--duration", type=float, default=60, help="Segundos de carga sostenida")
-    p.add_argument("--out-prefix", default="run", dest="out_prefix")
-    p.add_argument("--conn-limit", type=int, default=0, dest="conn_limit",
-                   help="Limite de conexiones del pool (0 = igual a --users)")
+    p = argparse.ArgumentParser(
+        description="Generador de carga para el monolito de Cheapest en AWS.")
+    p.add_argument("--endpoint", choices=["GET", "POST"])
+    p.add_argument("--users", type=int, default=1500,
+                   help="Concurrencia objetivo")
+    p.add_argument("--ramp-up", type=float, default=75,
+                   help="Segundos para escalar de 0 a --users")
+    p.add_argument("--duration", type=float, default=60,
+                   help="Segundos sosteniendo la concurrencia objetivo")
+    p.add_argument("--out-prefix", default="corrida",
+                   help="Prefijo del CSV de salida")
+    p.add_argument("--base-url", default=f"http://{ALB_DNS}",
+                   help="URL del ALB")
+    p.add_argument("--productos", default="productos.txt",
+                   help="Archivo con UUIDs reales de productos (para POST)")
+    p.add_argument("--conn-limit", type=int, default=0,
+                   help="Limite de conexiones del pool (0 = sin limite)")
+    p.add_argument("--baseline", action="store_true",
+                   help="Solo mide la latencia base contra /health y termina")
     args = p.parse_args()
 
-    if args.conn_limit == 0:
-        args.conn_limit = args.users
+    if args.baseline:
+        asyncio.run(medir_baseline(args.base_url))
+        return
 
-    check_ulimit(args.users)
-    productos = load_productos() if args.endpoint == "POST" else []
+    if not args.endpoint:
+        sys.exit("Debe indicar --endpoint GET o --endpoint POST "
+                 "(o usar --baseline).")
 
-    print(f"\n=== {args.endpoint} | users={args.users} | ramp-up={args.ramp_up}s "
-          f"| duracion sostenida={args.duration}s ===")
+    productos = cargar_productos(args.productos) if args.endpoint == "POST" else []
+    revisar_descriptores(args.users)
 
-    rows, elapsed = asyncio.run(run(args, productos))
+    print(f"\nDestino    : {args.base_url}")
+    print(f"Endpoint   : {args.endpoint}")
+    print(f"Usuarios   : {args.users}")
+    print(f"Ramp-up    : {args.ramp_up} s")
+    print(f"Sostenido  : {args.duration} s")
+    print(f"Total      : {args.ramp_up + args.duration} s")
+    print("\nEjecutando...")
 
-    steady = [r for r in rows if r["steady"]]
-    summarize(rows, elapsed, f"CORRIDA COMPLETA ({elapsed:.1f}s, incluye ramp-up)")
-    summarize(steady, args.duration, f"VENTANA SOSTENIDA ({args.duration:.0f}s) <-- comparar con ASR")
+    registros, t0, inicio_sostenido = asyncio.run(ejecutar(args, productos))
 
-    csv_path = f"{args.out_prefix}_{args.endpoint.lower()}.csv"
-    write_csv(rows, csv_path)
-    if rows:
-        make_plots(rows, args.out_prefix, args.endpoint)
+    absoluto_t0 = time.time() - (time.perf_counter() - t0)
+    corte = absoluto_t0 + args.ramp_up
+    sostenidos = [r for r in registros if r.t_inicio >= corte]
+
+    resumir(registros, args.ramp_up + args.duration, "Corrida completa")
+    m = resumir(sostenidos, args.duration, "Ventana sostenida (comparable con ASRs)")
+
+    veredicto(m)
+    if m:
+        fila_tabla(args, m)
+    exportar(registros, args.out_prefix, args.endpoint)
 
 
 if __name__ == "__main__":
